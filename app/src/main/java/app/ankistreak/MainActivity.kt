@@ -5,6 +5,8 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.TimePickerDialog
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -38,14 +40,38 @@ class MainActivity : Activity() {
     private lateinit var store: StreakStore
     private lateinit var content: LinearLayout
     private var checking = false
+    private var showingCrash = false
+    private val startupProblems = mutableListOf<String>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.install(this)
         store = StreakStore(this)
-        Notifications.createChannels(this)
-        Scheduler.ensureScheduled(this)
-        setupSystemBars()
+        buildRoot()
 
+        // If the app crashed last time, show the error instead of crashing again.
+        val crash = CrashLog.read(this)
+        if (crash != null) {
+            showCrash(crash)
+            return
+        }
+
+        safely("setting up notifications") { Notifications.createChannels(this) }
+        safely("scheduling background checks") { Scheduler.ensureScheduled(this) }
+        safely("styling the status bar") { setupSystemBars() }
+    }
+
+    /** Runs a non-essential startup step; if it fails the app keeps working and shows a note. */
+    private fun safely(what: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Throwable) {
+            android.util.Log.w("AnkiStreak", "Problem $what", e)
+            startupProblems += "Problem $what: $e"
+        }
+    }
+
+    private fun buildRoot() {
         val scroll = ScrollView(this).apply {
             setBackgroundColor(BG)
             isFillViewport = true
@@ -69,19 +95,68 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        refresh()
+        if (!showingCrash) refresh()
     }
 
     private fun refresh() {
-        if (checking) return
+        if (checking || showingCrash) return
         checking = true
         Thread {
-            val result = StreakChecker.check(applicationContext, fromUi = true)
+            val result = try {
+                StreakChecker.check(applicationContext, fromUi = true)
+            } catch (e: Throwable) {
+                CrashLog.save(this, e, "Error while reading AnkiDroid")
+                runOnUiThread {
+                    checking = false
+                    showCrash(CrashLog.read(this) ?: e.toString())
+                }
+                return@Thread
+            }
             runOnUiThread {
                 checking = false
-                if (!isFinishing && !isDestroyed) render(result)
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                try {
+                    render(result)
+                } catch (e: Throwable) {
+                    CrashLog.save(this, e, "Error while drawing the screen")
+                    showCrash(CrashLog.read(this) ?: e.toString())
+                }
             }
         }.start()
+    }
+
+    private fun showCrash(trace: String) {
+        showingCrash = true
+        content.removeAllViews()
+        content.addView(text("😕 Anki Streak hit an error", 20f, DARK, bold = true), spaced(24))
+        content.addView(
+            text("Tap \"Copy error\" and paste it to Claude so it can be fixed.", 15f, MUTED)
+                .apply { gravity = Gravity.CENTER },
+            spaced(8)
+        )
+        content.addView(button("Copy error") {
+            getSystemService(ClipboardManager::class.java)
+                ?.setPrimaryClip(ClipData.newPlainText("Anki Streak error", trace))
+            Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+        }, spaced(16))
+        content.addView(button("Try again", primary = false) {
+            CrashLog.clear(this)
+            showingCrash = false
+            recreate()
+        }, spaced(10))
+        val box = TextView(this).apply {
+            text = trace
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextColor(DARK)
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(10).toFloat()
+                setColor(0xFFF4F4F4.toInt())
+            }
+        }
+        content.addView(box, spaced(16))
     }
 
     // ---------------------------------------------------------------- screens
@@ -115,6 +190,9 @@ class MainActivity : Activity() {
                 content.addView(button("Open AnkiDroid", primary = false) { openAnki() }, spaced(10))
             }
             State.PENDING, State.DONE -> renderStreak(r)
+        }
+        for (p in startupProblems) {
+            content.addView(text(p, 11f, MUTED).apply { setTextIsSelectable(true) }, spaced(12))
         }
     }
 
